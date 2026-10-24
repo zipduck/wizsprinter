@@ -69,6 +69,33 @@ Any async no-argument method on `CombatMember` can be used as an attribute.
 
 Booleans compare numerically: `True == 1`, `False == 0`.
 
+### School
+
+`school` checks a combatant's current primary school, using the existing
+WizWalker participant reader. It does not check resistance, archmastery pips,
+or the school of a selected spell. School names are unquoted and case-insensitive.
+
+```text
+?(enemy.school == fire) pass | any<damage> @ enemy
+?(boss.school != storm) any<damage> @ boss | pass
+?(enemy(1).school == ice && enemy(1).health < 2000) any<damage> @ enemy(1) | pass
+?(any(enemies).school == death) pass | any<damage&aoe> @ aoe
+?(all(enemies).school != myth) any<damage&aoe> @ aoe | pass
+```
+
+Use `==` or `!=`; numeric ordering, percentages, numeric school IDs, and `avg`
+are rejected when parsing. The same attribute works with `self` and ally targets.
+The usual combat schools are `fire`, `ice`, `storm`, `myth`, `life`, `death`,
+`balance`, `star`, `sun`, `moon`, and `shadow`. Names come from WizWalker's
+school mapping; an unsupported name is a configuration error.
+
+Missing targets, missing participants, unknown school IDs, and read failures
+do not satisfy a school comparison, including `!=`. Empty groups are false.
+Existing group behavior applies: `any` can match a known member even when
+another member has an unknown school; `all` requires every member to match.
+A condition checks the stated member/group; it does not automatically select
+a matching enemy as the spell target. Specify the spell target separately.
+
 ### Hanging effect attributes
 
 These count active hanging effects on a member by reading their participant's
@@ -102,6 +129,7 @@ Disposition matching follows the game's logic: an effect with disposition
 
 ## Values
 
+- **School name**: `fire`, `Storm`, etc. -- only for `school ==` / `school !=`.
 - **Hard number**: `2000`, `0`, `3.5`
 - **Percentage**: `50%` -- computes `(current / max) * 100` using the
   corresponding `max_` attribute (e.g. `health` uses `max_health`).
