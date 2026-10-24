@@ -1,4 +1,6 @@
 import asyncio
+import re
+from html import unescape
 from typing import *
 
 import wizwalker
@@ -527,17 +529,27 @@ class SprintyCombat(CombatHandler):
         return await self.get_card_with_predicate(_pred)
 
     async def get_card_counts(self) -> Tuple[int, int]:
-        # Issue: #6. Very rare error
         async def _inner():
-            window = None
-            while window is None:
-                window, *_ = await self.client.root_window.get_windows_with_name("CountText")
-            text: str = await window.maybe_text()
-            _, count_text = text.splitlines()
-            count_text = count_text[8:-9]
-            count_text = count_text.replace("of", "").strip()  # I know this sucks
-            res1, res2 = count_text.split()
-            return int(res1), int(res2)
+            # Several controls can share this name; the first can be empty or
+            # hidden. Retry only after checking all of the available controls.
+            for window in await self.client.root_window.get_windows_with_name("CountText"):
+                try:
+                    if not await window.is_visible():
+                        continue
+                    text = await window.maybe_text()
+                except wizwalker.errors.WizWalkerMemoryError:
+                    continue  # A transitioning control need not hide a valid one.
+                if not isinstance(text, str):
+                    continue
+                # Read the displayed counts rather than fixed markup lengths
+                # or an exact number of lines. Preserve zero as a valid count.
+                plain = unescape(re.sub(r"<[^>]*>", " ", text))
+                match = re.fullmatch(r"\s*(?:Cards\s*)?(\d+)\s+of\s+(\d+)\s*", plain, re.IGNORECASE)
+                if match:
+                    remaining, total = map(int, match.groups())
+                    if remaining <= total:
+                        return remaining, total
+            return None
         try:
             return await wizwalker.utils.maybe_wait_for_any_value_with_timeout(_inner, sleep_time=0.2, timeout=2.0)
         except wizwalker.errors.ExceptionalTimeout:
