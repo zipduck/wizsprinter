@@ -14,7 +14,7 @@ Two pattern-scanned asm hooks (build/ASLR-resilient):
   forced width/height, so the device is (re)created at exactly that size.
 
 * VideoManagerHook — the per-frame "process pending video-mode change" function.
-  Its `this` (rcx) is the video manager, whose byte at +0x2229b is a pending-change
+  Its `this` (rcx) is the video manager, whose byte at +0x222a3 is a pending-change
   flag the engine polls each frame. We capture that `this` pointer to an export so
   we can set the flag and trigger the apply on demand.
 
@@ -30,10 +30,50 @@ from wizwalker.memory.hooks import SimpleHook
 from wizwalker.memory.memory_reader import Primitive
 
 # Video-manager field offsets (this build of WizardGraphicalClient.exe).
-MGR_PENDING_FLAG_OFF = 0x2229B  # byte: non-zero => apply pending video mode
+MGR_PENDING_FLAG_OFF = 0x222A3  # test realm: non-zero => apply pending video mode
 
 
-class SetModeResHook(SimpleHook):
+class _ResolutionHook(SimpleHook):
+    """Guard complete instructions and own exports through partial installation."""
+
+    HOOK_SIZE = 50
+
+    async def hook(self):
+        pattern, module = await self.get_pattern()
+        self.jump_address = await self.get_jump_address(pattern, module=module)
+        self.jump_original_bytecode = await self.read_bytes(self.jump_address, len(self.ORIGINAL))
+        if self.jump_original_bytecode != self.ORIGINAL:
+            raise RuntimeError(f'{type(self).__name__}: unexpected entry bytes')
+        try:
+            self.hook_address = await self.get_hook_address(self.HOOK_SIZE)
+            self.hook_bytecode = await self.get_hook_bytecode()
+            self.jump_bytecode = await self.get_jump_bytecode()
+            if len(self.hook_bytecode) > self.HOOK_SIZE or len(self.jump_bytecode) != len(self.ORIGINAL):
+                raise RuntimeError('Resolution trampoline size mismatch')
+            for name, size in self.exports:
+                await self.write_bytes(getattr(self, name), bytes(size))
+            await self.prehook()
+            await self.write_bytes(self.hook_address, self.hook_bytecode)
+            # A failed write may be partial: restoration must still be attempted.
+            self._entry_written = True
+            await self.write_bytes(self.jump_address, self.jump_bytecode)
+        except BaseException:
+            await self.unhook()
+            raise
+
+    async def unhook(self):
+        if getattr(self, '_entry_written', False):
+            await self.write_bytes(self.jump_address, self.jump_original_bytecode)
+            self._entry_written = False
+        for name, _ in self.exports:
+            address = getattr(self, name, None)
+            if address:
+                await self.free(address)
+                setattr(self, name, None)
+        # Shared scratch remains reserved until HookHandler.close().
+
+
+class SetModeResHook(_ResolutionHook):
     """Override setMode's width (edx) / height (r8d) with a forced size."""
 
     # mov [rsp+8],rbx ; mov [rsp+20],r9d ; mov [rsp+18],r8d ; mov [rsp+10],edx ;
@@ -44,6 +84,7 @@ class SetModeResHook(SimpleHook):
         rb"\x48\x81\xEC\xB0\x00\x00\x00"
     )
     instruction_length = 5  # mov qword [rsp+8], rbx
+    ORIGINAL = b"\x48\x89\x5c\x24\x08"
     # control block: u32 enabled, u32 width, u32 height
     exports = [("control_block", 12)]
 
@@ -60,28 +101,35 @@ class SetModeResHook(SimpleHook):
         )
 
 
-class VideoManagerHook(SimpleHook):
+class VideoManagerHook(_ResolutionHook):
     """Capture the video-manager `this` (rcx) at the per-frame mode checker.
 
-    The function was recompiled in a client update (2026-06) — new prologue, but
-    same semantics: rcx = manager at entry, and it still polls the pending byte at
-    +0x2229b. We anchor on the full prologue (frame setup + xmm spills + stack
-    canary load) up to `mov rbx, rcx`; the rip-relative __security_cookie load's
-    displacement is build-variable, so it is wildcarded.
+    Test realm outlines VidRestart from GamebryoClient::PreRender. Pin the new
+    frame and pending-byte comparison, then verify the diagnostic function name.
     """
 
-    # mov rax,rsp ; mov [rax+10],rbx ; mov [rax+18],rsi ; push rbp/rdi/r14 ;
-    # lea rbp,[rax-0x78] ; sub rsp,0x160 ; movaps xmm6/7/8 ;
-    # mov rax,[rip+cookie(wildcard)] ; xor rax,rsp ; mov [rbp+0x20],rax ; mov rbx,rcx
     pattern = (
-        rb"\x48\x8B\xC4\x48\x89\x58\x10\x48\x89\x70\x18\x55\x57\x41\x56"
-        rb"\x48\x8D\x68\x88\x48\x81\xEC\x60\x01\x00\x00"
+        rb"\x48\x8B\xC4\x55\x57\x41\x56\x48\x8D\x68\xB8\x48\x81\xEC\x30\x01\x00\x00"
+        rb"\x48\xC7\x44\x24\x70\xFE\xFF\xFF\xFF\x48\x89\x58\x10\x48\x89\x70\x18"
         rb"\x0F\x29\x70\xD8\x0F\x29\x78\xC8\x44\x0F\x29\x40\xB8"
-        rb"\x48\x8B\x05....\x48\x33\xC4\x48\x89\x45\x20\x48\x8B\xD9"
+        rb"\x48\x8B\xD9\x80\xB9\xA3\x22\x02\x00\x00"
     )
-    instruction_length = 7  # mov rax,rsp (3) ; mov [rax+0x10],rbx (4)
-    noops = 2               # jmp rel32 is 5 bytes; pad the 7-byte hole with 2 NOPs
+    ORIGINAL = b"\x48\x8B\xC4\x55\x57"
+    instruction_length = 5  # mov rax,rsp ; push rbp ; push rdi
+    _STRING_PROBE_OFFSET = 0x76
+    _EXPECTED_STRING = b"GamebryoClient::PreRender\x00"
     exports = [("manager_ptr", 8)]
+
+    async def get_jump_address(self, pattern, module=None):
+        address = await super().get_jump_address(pattern, module=module)
+        probe = address + self._STRING_PROBE_OFFSET
+        code = await self.read_bytes(probe, 7)
+        if code[:3] != b'\x48\x8d\x05':
+            raise RuntimeError('VideoManagerHook: unexpected name reference')
+        target = probe + 7 + struct.unpack('<i', code[3:])[0]
+        if await self.read_bytes(target, len(self._EXPECTED_STRING)) != self._EXPECTED_STRING:
+            raise RuntimeError('VideoManagerHook: unexpected function name')
+        return address
 
     async def bytecode_generator(self, packed_exports):
         mgr = packed_exports[0][1]  # packed 8-byte address of manager_ptr slot
@@ -89,8 +137,7 @@ class VideoManagerHook(SimpleHook):
             b"\x48\xB8" + mgr          # mov rax, manager_ptr  (our export slot)
             + b"\x48\x89\x08"          # mov [rax], rcx        (store the manager 'this')
             # ---- original overwritten instructions (rax recomputed by mov rax,rsp) ----
-            + b"\x48\x8B\xC4"          # mov rax, rsp
-            + b"\x48\x89\x58\x10"      # mov [rax+0x10], rbx
+            + self.ORIGINAL             # recompute rax=rsp, push rbp/rdi
         )
 
 
@@ -115,7 +162,7 @@ class ResolutionForcer:
 
     @property
     def installed(self) -> bool:
-        return self._setmode is not None
+        return self._setmode is not None and self._vm is not None
 
     async def install(self):
         if self.installed:
@@ -129,19 +176,16 @@ class ResolutionForcer:
             await self._setmode.hook()
             self._vm = VideoManagerHook(self.hook_handler)
             await self._vm.hook()
-        except Exception:
+        except BaseException:
             await self.uninstall()
             raise
 
     async def uninstall(self):
-        for hook in (self._setmode, self._vm):
+        for name in ('_setmode', '_vm'):
+            hook = getattr(self, name)
             if hook is not None:
-                try:
-                    await hook.unhook()
-                except Exception:
-                    pass
-        self._setmode = None
-        self._vm = None
+                await hook.unhook()
+                setattr(self, name, None)
 
     async def _manager_address(self) -> int:
         """The captured video-manager pointer (0 until the checker has run once)."""
@@ -290,7 +334,7 @@ def _assemble(asm: str) -> bytes:
     return bytes(ks.asm(asm, 0)[0])
 
 
-class WndProcNCHitHook(SimpleHook):
+class WndProcNCHitHook(_ResolutionHook):
     """Resize hit-codes near the window edges + optional frameless WM_NCCALCSIZE,
     so a window can be drag-resizable and (when frameless is set) borderless."""
 
@@ -304,6 +348,9 @@ class WndProcNCHitHook(SimpleHook):
         rb"\x48\x85\xC9\x74\x1C\x48\x8B\x01\x4C\x89\x4C.\x20\x4D\x8B\xC8"
     )
     instruction_length = 7  # sub rsp,0x38 ; mov r10,rcx
+    ORIGINAL = b"\x48\x83\xEC\x38\x4C\x8B\xD1"
+    noops = 2
+    HOOK_SIZE = 320
     exports = [("hit_rect", 24)]  # int32 left, top, right, bottom, margin, frameless
 
     async def get_hook_address(self, size: int) -> int:
@@ -333,11 +380,6 @@ class WndProcNCHitHook(SimpleHook):
                                        2_000_000_000, 2_000_000_000, 0, 0)
         )
 
-    async def unhook(self):
-        await super().unhook()
-        if getattr(self, "hit_rect", None):
-            await self.free(self.hit_rect)
-
 
 class WindowResizeBorder:
     """Installs the WndProc hook and keeps the window rect + frameless flag updated
@@ -358,14 +400,15 @@ class WindowResizeBorder:
             return
         await self.hook_handler._check_for_autobot()
         self._hook = WndProcNCHitHook(self.hook_handler)
-        await self._hook.hook()
+        try:
+            await self._hook.hook()
+        except BaseException:
+            await self.uninstall()
+            raise
 
     async def uninstall(self):
         if self._hook is not None:
-            try:
-                await self._hook.unhook()
-            except Exception:
-                pass
+            await self._hook.unhook()
             self._hook = None
 
     async def update_rect(self, left: int, top: int, right: int, bottom: int,
